@@ -38,7 +38,7 @@ class Screen:
 
     def __init__(self):
         self.cache, self.t = None, 0
-        self.warned = False
+        self.use_hypr = True
 
     def monitor(self):
         if self.cache and time.time() - self.t < 3:
@@ -71,29 +71,27 @@ class Screen:
             return None
 
     def move(self, fx, fy):
+        """Pindahkan kursor ke posisi relatif layar. Best-effort: tidak pernah melempar error."""
         m = self.monitor()
         if not m:
-            raise RuntimeError("hyprctl tidak menemukan monitor")
+            return
         fx, fy = min(1.0, max(0.0, fx)), min(1.0, max(0.0, fy))
         x, y = m["x"] + fx * (m["w"] - 1), m["y"] + fy * (m["h"] - 1)
-        out = self.hypr("dispatch", "movecursor", str(int(x)), str(int(y)))
-        if out != "ok" and not self.warned:
-            self.warned = True
-            print("hyprctl dispatch movecursor -> %r" % out)
-        # Verifikasi; jika kursor tidak sampai, koreksi dengan gerakan relatif (uinput).
-        for i in range(6):
+        if self.use_hypr:
+            out = self.hypr("dispatch", "movecursor", str(int(x)), str(int(y)))
+            if out != "ok":
+                self.use_hypr = False
+                print("hyprctl movecursor tidak berfungsi (%r); beralih ke gerakan relatif" % out[:120])
+        gain = 1.0 if self.use_hypr else 0.5  # diredam: akselerasi libinput membuat gerakan besar overshoot
+        for _ in range(8):
             pos = self.cursor_pos()
-            if pos is None:
+            if pos is None or not inj:
                 return
             dx, dy = x - pos[0], y - pos[1]
-            if abs(dx) <= 2 and abs(dy) <= 2:
+            if abs(dx) <= 3 and abs(dy) <= 3:
                 return
-            if args.debug:
-                print("kursor di %s, target (%d,%d), koreksi %d" % (pos, x, y, i + 1))
-            if inj:
-                inj.rel_move(round(dx), round(dy))
+            inj.rel_move(int(round(dx * gain)), int(round(dy * gain)))
             time.sleep(0.02)
-        raise RuntimeError("kursor tidak bisa dipindah (hyprctl: %r)" % out)
 
 
 screen = Screen()
@@ -169,19 +167,29 @@ def clip_get():
     return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
 
 
+def goto(d):
+    """Pindah ke koordinat absolut (pecahan layar) jika ada; tanpa x/y = posisi kursor sekarang."""
+    if "x" in d:
+        screen.move(float(d["x"]), float(d["y"]))
+
+
 def do_api(path, d):
     """Jalankan aksi kontrol. Melempar exception jika gagal."""
     if path == "/api/move":
         screen.move(float(d["x"]), float(d["y"]))
+    elif path == "/api/rel":
+        inj.rel_move(max(-3000, min(3000, int(d["dx"]))), max(-3000, min(3000, int(d["dy"]))))
     elif path == "/api/click":
-        screen.move(float(d["x"]), float(d["y"]))
+        goto(d)
         inj.click(d.get("button", "left"), 2 if d.get("double") else 1)
     elif path == "/api/down":
-        screen.move(float(d["x"]), float(d["y"]))
+        goto(d)
         inj.button("left", True)
     elif path == "/api/up":
-        screen.move(float(d["x"]), float(d["y"]))
-        inj.button("left", False)
+        try:
+            goto(d)
+        finally:
+            inj.button("left", False)  # tombol harus selalu dilepas
     elif path == "/api/scroll":
         inj.wheel(int(d.get("wheel", 0)), int(d.get("hwheel", 0)))
     elif path == "/api/key":

@@ -21,6 +21,8 @@ Buka `http://IP-laptop:8080` di HP. Opsi: `--scale 1.0` (lebih tajam), `--qualit
 `--output eDP-1`, `--view-only`, `--debug`.
 
 ## Cara pakai di HP
+- **Touchpad (panel bawah)**: geser = gerakkan kursor (halus), ketuk = klik, ketuk 2 jari = klik kanan, geser 2 jari = scroll, ketuk lalu langsung geser = drag. Tombol *Tahan (drag)* untuk menahan klik kiri. Tombol 🖱 menyembunyikan panel.
+- Layar sendiri juga bisa diketuk langsung (kurang halus).
 - **Ketuk** = klik kiri, **tahan** = klik kanan, **geser 1 jari** = drag (pilih teks), **geser 2 jari** = scroll.
 - **⌨** membuka keyboard HP. Ctrl/Alt/Shift/Super bersifat lengkap-sekali-pakai (tekan, lalu tombol lain).
 - Tombol Copy/Paste/Cut/All/Undo, Esc, Tab, Enter, panah, dll ada di bar bawah.

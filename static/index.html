@@ -8,6 +8,12 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;overscroll-behavi
 #bar{display:flex;gap:6px;padding:6px;background:#1c1c1c;overflow-x:auto;flex:none}
 #bar button,#clip button{flex:none;padding:10px 12px;font-size:15px;border:0;border-radius:8px;background:#333;color:#eee}
 #bar button.on{background:#4f8cff}
+#padwrap{flex:none;display:none;flex-direction:column;background:#101010;border-top:1px solid #333}
+#padwrap.show{display:flex}
+#padbtns{display:flex;gap:6px;padding:6px}
+#padbtns button{flex:1;padding:10px 4px;font-size:15px;border:0;border-radius:8px;background:#333;color:#eee}
+#padbtns button.on{background:#4f8cff}
+#pad{height:30vh;margin:0 6px 6px;border-radius:10px;background:#1a1a1a;touch-action:none;-webkit-user-select:none;user-select:none;color:#555;display:flex;align-items:center;justify-content:center;font-size:14px}
 #clip{display:none;padding:6px;background:#1c1c1c;gap:6px;flex-wrap:wrap}
 #clip.show{display:flex}
 #clip textarea{flex:1 1 100%;height:90px;font-size:16px;border-radius:8px;border:0;padding:8px;box-sizing:border-box}
@@ -18,6 +24,10 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;overscroll-behavi
 </style></head><body>
 <div id="app">
   <div id="stage"><img id="screen" src="/stream" alt="layar"></div>
+  <div id="padwrap" class="show">
+    <div id="padbtns"><button id="pL">Klik kiri</button><button id="pR">Klik kanan</button><button id="pDrag">Tahan (drag)</button></div>
+    <div id="pad">Touchpad: geser = gerak, ketuk = klik, 2 jari ketuk = klik kanan, 2 jari geser = scroll</div>
+  </div>
   <div id="clip">
     <textarea id="cliptext" placeholder="Teks untuk dikirim ke laptop / hasil clipboard laptop"></textarea>
     <button id="cPaste">Kirim &amp; tempel</button>
@@ -27,7 +37,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;overscroll-behavi
     <button id="cCopy">Salin ke HP</button>
   </div>
   <div id="bar">
-    <button id="bKb">⌨</button><button id="bClip">📋</button>
+    <button id="bKb">⌨</button><button id="bPad" class="on">🖱</button><button id="bClip">📋</button>
     <button data-mod="ctrl">Ctrl</button><button data-mod="alt">Alt</button><button data-mod="shift">Shift</button><button data-mod="super">Super</button>
     <button data-combo="ctrl+c">Copy</button><button data-combo="ctrl+v">Paste</button><button data-combo="ctrl+x">Cut</button>
     <button data-combo="ctrl+a">All</button><button data-combo="ctrl+z">Undo</button>
@@ -95,6 +105,40 @@ stage.addEventListener('touchend',e=>{
   if(e.touches.length===0)st=null;else st.moved=true;
 },{passive:false});
 stage.addEventListener('touchcancel',e=>{if(st&&st.drag)enq('/api/up',frac({clientX:st.x0,clientY:st.y0}));st=null});
+
+// Touchpad: gerakan relatif (halus), tanpa menyentuh layar
+let relPend=null;const GAIN=1.4;
+function rel(dx,dy){if(relPend){relPend.dx+=dx;relPend.dy+=dy;return}const o=relPend={dx,dy};q=q.then(()=>{relPend=null;return api('/api/rel',{dx:Math.round(o.dx),dy:Math.round(o.dy)})})}
+const pad=$('#pad');let pt=null,lastTap=0,dragLock=false;
+pad.addEventListener('touchstart',e=>{
+  e.preventDefault();
+  if(e.touches.length===1){
+    const t=e.touches[0],now=Date.now();
+    pt={x:t.clientX,y:t.clientY,t0:now,moved:0,two:false,acc:0,fx:0,fy:0,hold:false};
+    if(now-lastTap<300){pt.hold=true}   // ketuk lalu langsung geser = drag
+  }else if(e.touches.length===2&&pt){pt.two=true;pt.ly=avgY(e.touches);pt.tot=0;pt.t2=Date.now()}
+},{passive:false});
+pad.addEventListener('touchmove',e=>{
+  e.preventDefault();if(!pt)return;
+  if(pt.two&&e.touches.length>=2){const y=avgY(e.touches);pt.tot+=Math.abs(y-pt.ly);pt.acc+=y-pt.ly;pt.ly=y;const n=Math.trunc(pt.acc/20);if(n){pt.acc-=n*20;enq('/api/scroll',{wheel:n})}return}
+  if(pt.two||e.touches.length!==1)return;
+  const t=e.touches[0],dx=t.clientX-pt.x,dy=t.clientY-pt.y;pt.x=t.clientX;pt.y=t.clientY;pt.moved+=Math.abs(dx)+Math.abs(dy);
+  if(pt.hold&&!pt.down&&pt.moved>4){pt.down=true;enq('/api/down',{})}
+  pt.fx+=dx*GAIN;pt.fy+=dy*GAIN;const ix=Math.trunc(pt.fx),iy=Math.trunc(pt.fy);
+  if(ix||iy){pt.fx-=ix;pt.fy-=iy;rel(ix,iy)}
+},{passive:false});
+pad.addEventListener('touchend',e=>{
+  e.preventDefault();if(!pt)return;
+  if(pt.two){if(!pt.rc&&pt.tot<12&&Date.now()-pt.t2<400){pt.rc=true;enq('/api/click',{button:'right'})}if(e.touches.length===0)pt=null;return}
+  if(pt.down){enq('/api/up',{})}
+  else if(pt.moved<8&&Date.now()-pt.t0<250){enq('/api/click',{button:'left'});lastTap=Date.now()}
+  pt=null;
+},{passive:false});
+pad.addEventListener('touchcancel',e=>{if(pt&&pt.down)enq('/api/up',{});pt=null});
+$('#pL').onclick=()=>enq('/api/click',{button:'left'});
+$('#pR').onclick=()=>enq('/api/click',{button:'right'});
+$('#pDrag').onclick=function(){dragLock=!dragLock;this.classList.toggle('on',dragLock);enq(dragLock?'/api/down':'/api/up',{})};
+$('#bPad').onclick=function(){this.classList.toggle('on',$('#padwrap').classList.toggle('show'))};
 
 // Modifier lengket + tombol
 const mods={ctrl:false,alt:false,shift:false,super:false};
