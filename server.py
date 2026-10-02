@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""remote-luffy tahap 1: lihat layar Wayland/Hyprland dari browser HP (view-only).
+"""remote-luffy: lihat dan kontrol laptop Hyprland/Wayland dari browser HP.
 
-Hanya butuh Python 3 (stdlib) dan `grim`.
+Butuh: python3, grim, wl-clipboard, python3-pil (opsional, gambar JPEG tajam)
+Kontrol butuh akses tulis ke /dev/uinput (lihat README).
 
   export LUFFY_PASSWORD='password-panjang-dan-kuat'
-  python3 server.py                 # hanya localhost (cocok untuk cloudflared)
-  python3 server.py --host 0.0.0.0  # satu Wi-Fi (wajib lewat jaringan tepercaya)
+  python3 server.py --host 0.0.0.0
 """
-import argparse, hashlib, hmac, os, secrets, shutil, subprocess, threading, time
+import argparse, hashlib, hmac, io, json, os, secrets, shutil, subprocess, threading, time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOUNDARY = b"frame"
 MAX_FAILS, LOCKOUT = 5, 60  # 5 salah -> kunci IP 60 detik
+DEVNULL = subprocess.DEVNULL
 
 args = None
+inj = None  # Injector, atau None jika kontrol tidak tersedia
+control_msg = ""
 SECRET = secrets.token_bytes(32)  # token sesi hilang saat server restart
 fails = {}  # ip -> (jumlah, waktu terakhir)
 
@@ -25,36 +33,73 @@ def make_token():
     return hmac.new(SECRET, b"luffy-session", hashlib.sha256).hexdigest()
 
 
+class Screen:
+    """Monitor yang dipantau + penggerak kursor (hyprctl)."""
+
+    def __init__(self):
+        self.cache, self.t = None, 0
+
+    def monitor(self):
+        if self.cache and time.time() - self.t < 3:
+            return self.cache
+        try:
+            out = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, timeout=3).stdout
+            mons = json.loads(out)
+            if args.output:
+                mons = [m for m in mons if m["name"] == args.output] or mons
+            m = next((m for m in mons if m.get("focused")), mons[0])
+            w, h = m["width"] / m.get("scale", 1), m["height"] / m.get("scale", 1)
+            if m.get("transform", 0) % 2:
+                w, h = h, w
+            self.cache = {"name": m["name"], "x": m["x"], "y": m["y"], "w": w, "h": h}
+        except Exception:
+            self.cache = None
+        self.t = time.time()
+        return self.cache
+
+    def move(self, fx, fy):
+        m = self.monitor()
+        if not m:
+            raise RuntimeError("hyprctl tidak menemukan monitor")
+        fx, fy = min(1.0, max(0.0, fx)), min(1.0, max(0.0, fy))
+        x, y = m["x"] + fx * (m["w"] - 1), m["y"] + fy * (m["h"] - 1)
+        subprocess.run(["hyprctl", "dispatch", "movecursor", str(int(x)), str(int(y))],
+                       stdout=DEVNULL, stderr=DEVNULL, timeout=3)
+
+
+screen = Screen()
+
+
 class Capturer:
     """Satu thread memotret layar; berhenti sendiri kalau tidak ada penonton."""
 
     def __init__(self):
         self.cond = threading.Condition()
         self.frame, self.seq, self.viewers = None, 0, 0
-        self.fmt = "jpeg"
+        self.fmt = "jpeg" if Image else "png"
         threading.Thread(target=self.loop, daemon=True).start()
 
     def grab(self):
-        if self.fmt == "jpeg":
-            cmd = ["grim", "-t", "jpeg", "-q", str(args.quality)]
-        else:  # PNG: level 1 = kompresi cepat
-            cmd = ["grim", "-t", "png", "-l", "1"]
+        cmd = ["grim", "-c"]  # -c: sertakan kursor
+        cmd += ["-t", "ppm"] if Image else ["-t", "png", "-l", "1"]
         if args.scale != 1.0:
             cmd += ["-s", str(args.scale)]
-        if args.output:
-            cmd += ["-o", args.output]
+        m = screen.monitor()
+        if m:
+            cmd += ["-o", m["name"]]
         t0 = time.time()
         r = subprocess.run(cmd + ["-"], capture_output=True, timeout=10)
-        if self.fmt == "jpeg" and b"jpeg support disabled" in r.stderr:
-            print("grim tanpa dukungan JPEG, beralih ke PNG")
-            self.fmt = "png"
-            return self.grab()
         if r.returncode != 0 or not r.stdout:
             print("grim error (kode %d): %s" % (r.returncode, r.stderr.decode("utf-8", "replace").strip()))
             return None
+        data = r.stdout
+        if Image:
+            buf = io.BytesIO()
+            Image.open(io.BytesIO(data)).save(buf, "JPEG", quality=args.quality)
+            data = buf.getvalue()
         if args.debug:
-            print("frame %d KB, grim %.2fs" % (len(r.stdout) // 1024, time.time() - t0))
-        return r.stdout
+            print("frame %d KB, %.2fs" % (len(data) // 1024, time.time() - t0))
+        return data
 
     def loop(self):
         interval = 1.0 / args.fps
@@ -66,8 +111,9 @@ class Capturer:
             try:
                 data = self.grab()
             except Exception as e:
-                print("grim gagal:", e)
+                print("capture gagal:", e)
                 data = None
+                time.sleep(1)
             if data:
                 with self.cond:
                     self.frame, self.seq = data, self.seq + 1
@@ -85,11 +131,56 @@ class Capturer:
             return self.frame, self.seq
 
 
+def clip_set(text):
+    subprocess.run(["wl-copy"], input=text.encode(), stdout=DEVNULL, stderr=DEVNULL, timeout=3)
+
+
+def clip_get():
+    r = subprocess.run(["wl-paste", "-n"], capture_output=True, timeout=3)
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+
+
+def do_api(path, d):
+    """Jalankan aksi kontrol. Melempar exception jika gagal."""
+    if path == "/api/move":
+        screen.move(float(d["x"]), float(d["y"]))
+    elif path == "/api/click":
+        screen.move(float(d["x"]), float(d["y"]))
+        inj.click(d.get("button", "left"), 2 if d.get("double") else 1)
+    elif path == "/api/down":
+        screen.move(float(d["x"]), float(d["y"]))
+        inj.button("left", True)
+    elif path == "/api/up":
+        screen.move(float(d["x"]), float(d["y"]))
+        inj.button("left", False)
+    elif path == "/api/scroll":
+        inj.wheel(int(d.get("wheel", 0)), int(d.get("hwheel", 0)))
+    elif path == "/api/key":
+        inj.combo(str(d["combo"]))
+    elif path == "/api/type":
+        text = str(d["text"])[:5000]
+        if inj.can_type(text):
+            inj.type_text(text)
+        else:  # karakter non-US: lewat clipboard
+            clip_set(text)
+            inj.combo("ctrl+v")
+    elif path == "/api/clipset":
+        clip_set(str(d["text"])[:100000])
+        if d.get("paste"):
+            time.sleep(0.05)
+            inj.combo(str(d["paste"]))
+    else:
+        return False
+    return True
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "luffy"
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *a):
-        print("%s %s" % (self.client_address[0], fmt % a))
+        if args.debug or "/api/" not in (a[0] if a else ""):
+            print("%s %s" % (self.client_address[0], fmt % a))
 
     def authed(self):
         c = SimpleCookie(self.headers.get("Cookie", ""))
@@ -107,12 +198,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def json(self, code, obj):
+        self.send(code, json.dumps(obj).encode(), "application/json")
+
     def page(self, name):
         with open(os.path.join(HERE, "static", name), "rb") as f:
             return f.read()
 
     def do_GET(self):
-        if self.path == "/login":
+        if self.path == "/login" or self.path.startswith("/login?"):
             return self.send(200, self.page("login.html"))
         if not self.authed():
             return self.send(302, headers=[("Location", "/login")])
@@ -120,30 +214,59 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, self.page("index.html"))
         if self.path == "/stream":
             return self.stream()
+        if self.path == "/api/info":
+            return self.json(200, {"control": inj is not None, "message": control_msg})
+        if self.path == "/api/clip":
+            try:
+                return self.json(200, {"text": clip_get()})
+            except Exception as e:
+                return self.json(500, {"error": "wl-paste gagal: %s" % e})
         self.send(404, b"not found", "text/plain")
 
+    def read_body(self):
+        length = min(int(self.headers.get("Content-Length", 0)), 200000)
+        return self.rfile.read(length)
+
     def do_POST(self):
-        if self.path != "/login":
+        if self.path == "/login":
+            return self.login()
+        body = self.read_body()
+        if not self.path.startswith("/api/"):
             return self.send(404, b"not found", "text/plain")
+        if not self.authed():
+            return self.json(401, {"error": "belum login"})
+        # JSON-only: mencegah form lintas-situs memicu aksi
+        if not self.headers.get("Content-Type", "").startswith("application/json"):
+            return self.json(403, {"error": "content-type harus application/json"})
+        if inj is None:
+            return self.json(503, {"error": control_msg})
+        try:
+            ok = do_api(self.path, json.loads(body or b"{}"))
+        except Exception as e:
+            return self.json(400, {"error": "%s: %s" % (type(e).__name__, e)})
+        self.json(200 if ok else 404, {"ok": ok})
+
+    def login(self):
         ip = self.client_address[0]
         n, last = fails.get(ip, (0, 0))
+        form = parse_qs(self.read_body().decode("utf-8", "replace"))
         if n >= MAX_FAILS and time.time() - last < LOCKOUT:
             return self.send(429, b"Terlalu banyak percobaan. Tunggu sebentar.", "text/plain")
-        length = min(int(self.headers.get("Content-Length", 0)), 4096)
-        form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
         pw = form.get("password", [""])[0]
         if hmac.compare_digest(pw.encode(), args.password.encode()):
             fails.pop(ip, None)
-            flags = "; HttpOnly; SameSite=Strict; Path=/" + ("; Secure" if args.secure_cookie else "")
+            flags = "; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000" + ("; Secure" if args.secure_cookie else "")
             return self.send(302, headers=[("Location", "/"), ("Set-Cookie", "luffy=%s%s" % (make_token(), flags))])
         fails[ip] = (n + 1 if time.time() - last < LOCKOUT else 1, time.time())
         time.sleep(1)
         self.send(302, headers=[("Location", "/login?err=1")])
 
     def stream(self):
+        self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=" + BOUNDARY.decode())
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         self.end_headers()
         cap.join(1)
         last = -1
@@ -152,8 +275,8 @@ class Handler(BaseHTTPRequestHandler):
                 frame, last = cap.wait_new(last)
                 if frame is None:
                     continue
-                self.wfile.write(b"--" + BOUNDARY + b"\r\nContent-Type: image/" + cap.fmt.encode() + b"\r\nContent-Length: "
-                                 + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
+                self.wfile.write(b"--" + BOUNDARY + b"\r\nContent-Type: image/" + cap.fmt.encode()
+                                 + b"\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
@@ -161,15 +284,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global args, cap
+    global args, cap, inj, control_msg
     p = argparse.ArgumentParser()
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
-    p.add_argument("--fps", type=float, default=8)
-    p.add_argument("--quality", type=int, default=60, help="kualitas JPEG 1-100")
-    p.add_argument("--scale", type=float, default=0.5, help="skala gambar (0.5 = setengah)")
-    p.add_argument("--output", help="nama monitor (hyprctl monitors), default semua")
-    p.add_argument("--debug", action="store_true", help="cetak waktu tiap frame")
+    p.add_argument("--fps", type=float, default=6)
+    p.add_argument("--quality", type=int, default=70, help="kualitas JPEG 1-100 (butuh python3-pil)")
+    p.add_argument("--scale", type=float, default=0.75, help="skala gambar (1.0 = tajam penuh)")
+    p.add_argument("--output", help="nama monitor (hyprctl monitors); default monitor yang fokus")
+    p.add_argument("--view-only", action="store_true", help="matikan kontrol")
+    p.add_argument("--debug", action="store_true", help="cetak waktu frame dan semua request")
     p.add_argument("--secure-cookie", action="store_true", help="aktifkan jika diakses lewat HTTPS (cloudflared)")
     args = p.parse_args()
     args.password = os.environ.get("LUFFY_PASSWORD", "")
@@ -177,6 +301,24 @@ def main():
         raise SystemExit("Set LUFFY_PASSWORD minimal 12 karakter.")
     if not shutil.which("grim"):
         raise SystemExit("grim belum terpasang (sudo apt install grim).")
+    if not Image:
+        print("Catatan: python3-pil belum terpasang -> gambar PNG (buram/berat). sudo apt install python3-pil")
+
+    if args.view_only:
+        control_msg = "Mode view-only."
+    else:
+        missing = [t for t in ("hyprctl", "wl-copy", "wl-paste") if not shutil.which(t)]
+        if missing:
+            control_msg = "Perintah belum ada: %s (sudo apt install wl-clipboard)." % ", ".join(missing)
+        else:
+            try:
+                import inject
+                inj = inject.Injector()
+            except OSError as e:
+                control_msg = ("Tidak bisa membuka /dev/uinput (%s). Jalankan: sudo modprobe uinput && "
+                               "sudo setfacl -m u:$USER:rw /dev/uinput" % e)
+    print("Kontrol:", "AKTIF" if inj else "NONAKTIF - " + control_msg)
+
     cap = Capturer()
     print("Berjalan di http://%s:%d" % (args.host, args.port))
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
