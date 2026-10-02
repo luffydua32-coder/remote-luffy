@@ -11,6 +11,8 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;overscroll-behavi
 #clip{display:none;padding:6px;background:#1c1c1c;gap:6px;flex-wrap:wrap}
 #clip.show{display:flex}
 #clip textarea{flex:1 1 100%;height:90px;font-size:16px;border-radius:8px;border:0;padding:8px;box-sizing:border-box}
+#pop{position:fixed;display:none;grid-template-columns:repeat(2,1fr);gap:6px;padding:8px;background:#222;border-radius:12px;box-shadow:0 4px 20px #000a;z-index:10;width:230px}
+#pop button{padding:12px 6px;font-size:15px;border:0;border-radius:8px;background:#3a3a3a;color:#eee}
 #kb{position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;border:0;padding:0}
 #toast{position:fixed;top:8px;left:50%;transform:translateX(-50%);background:#000c;color:#fff;padding:8px 12px;border-radius:8px;font-size:14px;display:none;max-width:90vw}
 </style></head><body>
@@ -34,6 +36,12 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;overscroll-behavi
     <button data-key="home">Home</button><button data-key="end">End</button><button data-key="pageup">PgUp</button><button data-key="pagedown">PgDn</button>
   </div>
 </div>
+<div id="pop">
+  <button data-combo="ctrl+c">Copy</button><button data-combo="ctrl+v">Paste</button>
+  <button data-combo="ctrl+x">Cut</button><button data-combo="ctrl+a">Select all</button>
+  <button data-combo="ctrl+z">Undo</button><button data-combo="ctrl+shift+v">Paste terminal</button>
+  <button id="pGet">Clipboard laptop → HP</button><button id="pSend">Kirim teks HP → laptop</button>
+</div>
 <input id="kb" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
 <div id="toast"></div>
 <script>
@@ -56,17 +64,21 @@ function frac(t){
   return{x:Math.min(1,Math.max(0,(t.clientX-l)/w)),y:Math.min(1,Math.max(0,(t.clientY-tp)/h))}
 }
 // Gestur: ketuk=klik, tahan=klik kanan, geser 1 jari=drag, geser 2 jari=scroll
-let st=null;const avgY=ts=>(ts[0].clientY+ts[1].clientY)/2;
+let st=null,swallow=false;const pop=$('#pop');
+function showPop(x,y){pop.style.display='grid';const w=pop.offsetWidth,h=pop.offsetHeight;pop.style.left=Math.max(6,Math.min(innerWidth-w-6,x-w/2))+'px';pop.style.top=Math.max(6,Math.min(innerHeight-h-6,y-h-20))+'px'}
+function hidePop(){pop.style.display='none'}
+const avgY=ts=>(ts[0].clientY+ts[1].clientY)/2;
 stage.addEventListener('touchstart',e=>{
   e.preventDefault();
-  if(e.touches.length===1){
+  if(pop.style.display==='grid'){hidePop();swallow=true;st=null;return}
+  if(e.touches.length===1){swallow=false;
     const t=e.touches[0];st={x0:t.clientX,y0:t.clientY,moved:false,drag:false,long:false,two:false};
     st.timer=setTimeout(()=>{if(st&&!st.moved&&!st.two){st.long=true;navigator.vibrate&&navigator.vibrate(30);enq('/api/click',{...frac(t),button:'right'})}},550);
-  }else if(e.touches.length===2&&st&&!st.drag){clearTimeout(st.timer);st.two=true;st.lastY=avgY(e.touches);st.acc=0}
+  }else if(e.touches.length===2&&st&&!st.drag){clearTimeout(st.timer);st.two=true;st.lastY=avgY(e.touches);st.acc=0;st.tot=0;st.t2=Date.now();st.cx=(e.touches[0].clientX+e.touches[1].clientX)/2}
 },{passive:false});
 stage.addEventListener('touchmove',e=>{
   e.preventDefault();if(!st)return;
-  if(st.two&&e.touches.length>=2){const y=avgY(e.touches);st.acc+=y-st.lastY;st.lastY=y;const n=Math.trunc(st.acc/25);if(n){st.acc-=n*25;enq('/api/scroll',{wheel:n})}return}
+  if(st.two&&e.touches.length>=2){const y=avgY(e.touches);st.tot+=Math.abs(y-st.lastY);st.acc+=y-st.lastY;st.lastY=y;const n=Math.trunc(st.acc/25);if(n){st.acc-=n*25;enq('/api/scroll',{wheel:n})}return}
   if(st.two||e.touches.length!==1)return;
   const t=e.touches[0];
   if(!st.drag&&!st.long&&Math.hypot(t.clientX-st.x0,t.clientY-st.y0)>10){
@@ -75,8 +87,9 @@ stage.addEventListener('touchmove',e=>{
   if(st.drag)move(frac(t));
 },{passive:false});
 stage.addEventListener('touchend',e=>{
-  e.preventDefault();if(!st)return;clearTimeout(st.timer);
+  e.preventDefault();if(swallow){if(e.touches.length===0)swallow=false;return}if(!st)return;clearTimeout(st.timer);
   const t=e.changedTouches[0];
+  if(st.two&&!st.popped&&st.tot<15&&Date.now()-st.t2<500){st.popped=true;showPop(st.cx,t.clientY)}
   if(st.drag){enq('/api/up',frac(t))}
   else if(!st.long&&!st.two&&!st.moved){enq('/api/click',{...frac(t),button:'left'})}
   if(e.touches.length===0)st=null;else st.moved=true;
@@ -88,7 +101,7 @@ const mods={ctrl:false,alt:false,shift:false,super:false};
 document.querySelectorAll('[data-mod]').forEach(b=>b.onclick=()=>{const m=b.dataset.mod;mods[m]=!mods[m];b.classList.toggle('on',mods[m])});
 function combo(k){const m=Object.keys(mods).filter(x=>mods[x]);Object.keys(mods).forEach(x=>mods[x]=false);document.querySelectorAll('[data-mod]').forEach(b=>b.classList.remove('on'));return[...m,k].join('+')}
 document.querySelectorAll('[data-key]').forEach(b=>b.onclick=()=>enq('/api/key',{combo:combo(b.dataset.key)}));
-document.querySelectorAll('[data-combo]').forEach(b=>b.onclick=()=>enq('/api/key',{combo:b.dataset.combo}));
+document.querySelectorAll('[data-combo]').forEach(b=>b.onclick=()=>{enq('/api/key',{combo:b.dataset.combo});hidePop()});
 
 // Keyboard HP -> laptop
 const SENT='        ';function resetKb(){kb.value=SENT;kb.setSelectionRange(SENT.length,SENT.length)}
@@ -123,5 +136,7 @@ $('#cCopy').onclick=async()=>{ta.focus();ta.select();let ok=false;try{ok=documen
   if(!ok&&navigator.clipboard){try{await navigator.clipboard.writeText(ta.value);ok=true}catch(e){}}
   toast(ok?'Tersalin ke HP':'Gagal; tahan teks lalu pilih Salin')};
 
+$('#pGet').onclick=()=>{hidePop();$('#clip').classList.add('show');$('#cGet').click()};
+$('#pSend').onclick=()=>{hidePop();$('#clip').classList.add('show');ta.focus()};
 fetch('/api/info').then(r=>r.json()).then(j=>{if(!j.control)toast('Kontrol nonaktif: '+j.message)}).catch(()=>{});
 </script></body></html>
