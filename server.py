@@ -7,7 +7,7 @@ Kontrol butuh akses tulis ke /dev/uinput (lihat README).
   export LUFFY_PASSWORD='password-panjang-dan-kuat'
   python3 server.py --host 0.0.0.0
 """
-import argparse, hashlib, hmac, io, json, os, secrets, shutil, subprocess, threading, time
+import argparse, signal, hashlib, hmac, io, json, os, secrets, shutil, subprocess, threading, time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
@@ -38,6 +38,7 @@ class Screen:
 
     def __init__(self):
         self.cache, self.t = None, 0
+        self.warned = False
 
     def monitor(self):
         if self.cache and time.time() - self.t < 3:
@@ -57,14 +58,42 @@ class Screen:
         self.t = time.time()
         return self.cache
 
+    @staticmethod
+    def hypr(*a):
+        r = subprocess.run(["hyprctl", *a], capture_output=True, text=True, timeout=3)
+        return (r.stdout + r.stderr).strip()
+
+    def cursor_pos(self):
+        try:
+            x, y = (float(v) for v in self.hypr("cursorpos").split(","))
+            return x, y
+        except Exception:
+            return None
+
     def move(self, fx, fy):
         m = self.monitor()
         if not m:
             raise RuntimeError("hyprctl tidak menemukan monitor")
         fx, fy = min(1.0, max(0.0, fx)), min(1.0, max(0.0, fy))
         x, y = m["x"] + fx * (m["w"] - 1), m["y"] + fy * (m["h"] - 1)
-        subprocess.run(["hyprctl", "dispatch", "movecursor", str(int(x)), str(int(y))],
-                       stdout=DEVNULL, stderr=DEVNULL, timeout=3)
+        out = self.hypr("dispatch", "movecursor", str(int(x)), str(int(y)))
+        if out != "ok" and not self.warned:
+            self.warned = True
+            print("hyprctl dispatch movecursor -> %r" % out)
+        # Verifikasi; jika kursor tidak sampai, koreksi dengan gerakan relatif (uinput).
+        for i in range(6):
+            pos = self.cursor_pos()
+            if pos is None:
+                return
+            dx, dy = x - pos[0], y - pos[1]
+            if abs(dx) <= 2 and abs(dy) <= 2:
+                return
+            if args.debug:
+                print("kursor di %s, target (%d,%d), koreksi %d" % (pos, x, y, i + 1))
+            if inj:
+                inj.rel_move(round(dx), round(dy))
+            time.sleep(0.02)
+        raise RuntimeError("kursor tidak bisa dipindah (hyprctl: %r)" % out)
 
 
 screen = Screen()
@@ -318,6 +347,16 @@ def main():
                 control_msg = ("Tidak bisa membuka /dev/uinput (%s). Jalankan: sudo modprobe uinput && "
                                "sudo setfacl -m u:$USER:rw /dev/uinput" % e)
     print("Kontrol:", "AKTIF" if inj else "NONAKTIF - " + control_msg)
+
+    # Ctrl+C yang disuntikkan dari HP bisa mendarat di terminal ini; keluar butuh 2x Ctrl+C.
+    last_int = [0.0]
+
+    def on_int(sig, frm):
+        if time.time() - last_int[0] < 1.5:
+            raise KeyboardInterrupt
+        last_int[0] = time.time()
+        print("\nTekan Ctrl+C sekali lagi (dalam 1,5 detik) untuk keluar.")
+    signal.signal(signal.SIGINT, on_int)
 
     cap = Capturer()
     print("Berjalan di http://%s:%d" % (args.host, args.port))

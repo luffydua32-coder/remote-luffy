@@ -77,6 +77,12 @@ class Injector:
             self.button(name, False)
             time.sleep(0.04)
 
+    def rel_move(self, dx, dy):
+        with self.lock:
+            self.mouse.emit(EV_REL, REL_X, int(dx))
+            self.mouse.emit(EV_REL, REL_Y, int(dy))
+            self.mouse.emit(EV_SYN, 0, 0)
+
     def wheel(self, n=0, h=0):
         with self.lock:
             if n:
