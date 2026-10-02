@@ -39,8 +39,14 @@ class Capturer:
             cmd += ["-s", str(args.scale)]
         if args.output:
             cmd += ["-o", args.output]
+        t0 = time.time()
         r = subprocess.run(cmd + ["-"], capture_output=True, timeout=10)
-        return r.stdout if r.returncode == 0 and r.stdout else None
+        if r.returncode != 0 or not r.stdout:
+            print("grim error (kode %d): %s" % (r.returncode, r.stderr.decode("utf-8", "replace").strip()))
+            return None
+        if args.debug:
+            print("frame %d KB, grim %.2fs" % (len(r.stdout) // 1024, time.time() - t0))
+        return r.stdout
 
     def loop(self):
         interval = 1.0 / args.fps
@@ -155,6 +161,7 @@ def main():
     p.add_argument("--quality", type=int, default=60, help="kualitas JPEG 1-100")
     p.add_argument("--scale", type=float, default=0.5, help="skala gambar (0.5 = setengah)")
     p.add_argument("--output", help="nama monitor (hyprctl monitors), default semua")
+    p.add_argument("--debug", action="store_true", help="cetak waktu tiap frame")
     p.add_argument("--secure-cookie", action="store_true", help="aktifkan jika diakses lewat HTTPS (cloudflared)")
     args = p.parse_args()
     args.password = os.environ.get("LUFFY_PASSWORD", "")
