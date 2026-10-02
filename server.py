@@ -31,16 +31,24 @@ class Capturer:
     def __init__(self):
         self.cond = threading.Condition()
         self.frame, self.seq, self.viewers = None, 0, 0
+        self.fmt = "jpeg"
         threading.Thread(target=self.loop, daemon=True).start()
 
     def grab(self):
-        cmd = ["grim", "-t", "jpeg", "-q", str(args.quality)]
+        if self.fmt == "jpeg":
+            cmd = ["grim", "-t", "jpeg", "-q", str(args.quality)]
+        else:  # PNG: level 1 = kompresi cepat
+            cmd = ["grim", "-t", "png", "-l", "1"]
         if args.scale != 1.0:
             cmd += ["-s", str(args.scale)]
         if args.output:
             cmd += ["-o", args.output]
         t0 = time.time()
         r = subprocess.run(cmd + ["-"], capture_output=True, timeout=10)
+        if self.fmt == "jpeg" and b"jpeg support disabled" in r.stderr:
+            print("grim tanpa dukungan JPEG, beralih ke PNG")
+            self.fmt = "png"
+            return self.grab()
         if r.returncode != 0 or not r.stdout:
             print("grim error (kode %d): %s" % (r.returncode, r.stderr.decode("utf-8", "replace").strip()))
             return None
@@ -144,7 +152,7 @@ class Handler(BaseHTTPRequestHandler):
                 frame, last = cap.wait_new(last)
                 if frame is None:
                     continue
-                self.wfile.write(b"--" + BOUNDARY + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                self.wfile.write(b"--" + BOUNDARY + b"\r\nContent-Type: image/" + cap.fmt.encode() + b"\r\nContent-Length: "
                                  + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
         except (BrokenPipeError, ConnectionResetError):
             pass
